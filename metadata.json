@@ -1,0 +1,7 @@
+{
+  "name": "WhisperType Web",
+  "description": "A high-performance AI voice dictation workspace inspired by WhisperTyping. Features local-style recording, AI post-processing modes, and seamless text management.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
