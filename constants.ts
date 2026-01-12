@@ -34,7 +34,7 @@ export const AI_MODES_CONFIG: Record<AiMode, { icon: string; prompt: string; des
 };
 
 export const INITIAL_SETTINGS = {
-  defaultMode: AiMode.POLISHED,
+  defaultMode: AiMode.VERBATIM,
   autoCopy: false,
   language: 'en-US',
   selectedMicrophoneId: ''

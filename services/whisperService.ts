@@ -2,45 +2,56 @@
 const WORKER_CODE = `
 import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js';
 
-// Disable local models to force download from HuggingFace Hub
-env.allowLocalModels = false;
-env.useBrowserCache = true;
+// Define local model path configuration
+env.allowLocalModels = true;
+env.allowRemoteModels = false;
+env.localModelPath = '/models/';
 
 let transcriber = null;
 
 self.onmessage = async (e) => {
   const { type, audio } = e.data;
+  console.log('[Whisper Worker] Received message:', type, audio ? 'audio length: ' + audio.length : '');
 
   try {
     if (type === 'load') {
+      console.log('[Whisper Worker] Loading model...');
       if (!transcriber) {
-        // Using quantized whisper-tiny.en for speed and reasonable accuracy (~40MB)
+        // Using quantized whisper-tiny.en which should be available locally
         transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en', {
           progress_callback: (data) => {
             self.postMessage({ type: 'progress', data });
           }
         });
       }
+      console.log('[Whisper Worker] Model loaded successfully');
       self.postMessage({ type: 'ready' });
     } else if (type === 'transcribe') {
       if (!transcriber) {
         throw new Error("Transcriber not initialized");
       }
       
+      console.log('[Whisper Worker] Starting transcription, audio samples:', audio.length);
+      
       // Run transcription
-      const output = await transcriber(audio, {
+      // Note: For English-only models (whisper-tiny.en), do NOT force 'language' 
+      // as they don't have the multilingual token set.
+      const output = await transcriber(new Float32Array(audio), {
         chunk_length_s: 30,
         stride_length_s: 5,
-        language: 'english',
         task: 'transcribe',
       });
+      
+      console.log('[Whisper Worker] Raw output:', JSON.stringify(output));
       
       // Output structure differs slightly based on version/task, usually it's { text: "..." } or [{ text: "..." }]
       const text = Array.isArray(output) ? output[0].text : output.text;
       
+      console.log('[Whisper Worker] Extracted text:', text);
       self.postMessage({ type: 'result', text });
     }
   } catch (err) {
+    console.error('[Whisper Worker] Error:', err);
     self.postMessage({ type: 'error', error: err.message });
   }
 };
@@ -64,12 +75,15 @@ export const initWhisper = (onProgress?: (data: any) => void): Promise<void> => 
     worker = new Worker(URL.createObjectURL(blob), { type: 'module' });
 
     worker.onmessage = (e) => {
+      console.log('[Whisper] Worker message:', e.data);
       const { type, data, error } = e.data;
       if (type === 'ready') {
+        console.log('[Whisper] Model ready');
         resolve();
       } else if (type === 'progress') {
         if (onProgressCallback) onProgressCallback(data);
       } else if (type === 'error') {
+        console.error('[Whisper] Worker error:', error);
         reject(new Error(error));
       }
     };
@@ -83,6 +97,11 @@ export const initWhisper = (onProgress?: (data: any) => void): Promise<void> => 
 };
 
 export const transcribeWithWhisper = async (audioBlob: Blob): Promise<string> => {
+  console.log('[Whisper] transcribeWithWhisper called', {
+    blobSize: audioBlob.size,
+    blobType: audioBlob.type
+  });
+
   if (!worker) {
     throw new Error("Whisper model not initialized. Call initWhisper() first.");
   }
@@ -90,16 +109,33 @@ export const transcribeWithWhisper = async (audioBlob: Blob): Promise<string> =>
   // Resample audio to 16kHz (required by Whisper)
   const audioData = await decodeAndResample(audioBlob);
 
+  // Calculate max amplitude for debugging
+  let maxAmp = 0;
+  for (let i = 0; i < audioData.length; i++) {
+    const absVal = Math.abs(audioData[i]);
+    if (absVal > maxAmp) maxAmp = absVal;
+  }
+  console.log('[Whisper] Audio resampled', {
+    samples: audioData.length,
+    durationSec: (audioData.length / 16000).toFixed(2),
+    maxAmplitude: maxAmp.toFixed(4)
+  });
+
   return new Promise((resolve, reject) => {
     if (!worker) return reject("Worker not initialized");
 
+    console.log('[Whisper] Sending audio to worker...');
+
     const handleMessage = (e: MessageEvent) => {
+      console.log('[Whisper] Transcribe response:', e.data);
       const { type, text, error } = e.data;
       if (type === 'result') {
         worker!.removeEventListener('message', handleMessage);
+        console.log('[Whisper] Transcription result:', text);
         resolve(text);
       } else if (type === 'error') {
         worker!.removeEventListener('message', handleMessage);
+        console.error('[Whisper] Transcription error:', error);
         reject(new Error(error));
       }
     };
@@ -109,52 +145,47 @@ export const transcribeWithWhisper = async (audioBlob: Blob): Promise<string> =>
   });
 };
 
-// Robust audio decoder and resampler
+// Robust audio decoder and resampler using OfflineAudioContext
 async function decodeAndResample(audioBlob: Blob): Promise<Float32Array> {
   const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-  
+
   try {
     const arrayBuffer = await audioBlob.arrayBuffer();
+    console.log('[Whisper] ArrayBuffer size:', arrayBuffer.byteLength);
+
+    // 1. Decode the audio
     const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-    
-    // 1. Convert to Mono (Average channels if stereo)
-    let sourceData = audioBuffer.getChannelData(0);
-    
-    if (audioBuffer.numberOfChannels > 1) {
-      const ch2 = audioBuffer.getChannelData(1);
-      const mono = new Float32Array(sourceData.length);
-      for (let i = 0; i < sourceData.length; i++) {
-        mono[i] = (sourceData[i] + ch2[i]) / 2;
-      }
-      sourceData = mono;
-    }
+    console.log('[Whisper] Decoded audio:', {
+      duration: audioBuffer.duration.toFixed(2) + 's',
+      originalSampleRate: audioBuffer.sampleRate,
+      channels: audioBuffer.numberOfChannels
+    });
 
-    // 2. Resample to 16kHz if necessary
+    // 2. Resample to 16kHz using OfflineAudioContext
+    // This uses the browser's native high-quality resampling
     const targetSampleRate = 16000;
-    let resampledData: Float32Array;
+    const targetLength = Math.ceil(audioBuffer.duration * targetSampleRate);
 
-    if (audioBuffer.sampleRate === targetSampleRate) {
-      resampledData = sourceData;
-    } else {
-      // Manual Linear Interpolation Resampling (Safer than OfflineAudioContext)
-      const ratio = audioBuffer.sampleRate / targetSampleRate;
-      const newLength = Math.round(sourceData.length / ratio);
-      resampledData = new Float32Array(newLength);
-      
-      for (let i = 0; i < newLength; i++) {
-        const position = i * ratio;
-        const index = Math.floor(position);
-        const fraction = position - index;
-        
-        if (index >= sourceData.length - 1) {
-          resampledData[i] = sourceData[sourceData.length - 1];
-        } else {
-          resampledData[i] = sourceData[index] * (1 - fraction) + sourceData[index + 1] * fraction;
-        }
-      }
-    }
+    // Create offline context at 16kHz, 1 channel (mono)
+    const offlineCtx = new OfflineAudioContext(1, targetLength, targetSampleRate);
 
-    // 3. Normalize Audio
+    const source = offlineCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(offlineCtx.destination);
+    source.start(0);
+
+    console.log('[Whisper] Rendering offline context...');
+    const renderedBuffer = await offlineCtx.startRendering();
+
+    console.log('[Whisper] Resampled audio:', {
+      samples: renderedBuffer.length,
+      duration: renderedBuffer.duration.toFixed(2),
+      sampleRate: renderedBuffer.sampleRate
+    });
+
+    // 3. Extract channel data and normalize
+    const resampledData = renderedBuffer.getChannelData(0);
+
     return normalizeAudio(resampledData);
 
   } catch (e) {
@@ -167,25 +198,32 @@ async function decodeAndResample(audioBlob: Blob): Promise<Float32Array> {
 
 function normalizeAudio(data: Float32Array): Float32Array {
   let max = 0;
+  let sum = 0;
   for (let i = 0; i < data.length; i++) {
     const val = Math.abs(data[i]);
     if (val > max) max = val;
+    sum += val;
   }
+
+  const avg = sum / data.length;
+  console.log(`[Whisper] Audio Stats - Max Amp: ${max.toFixed(5)}, Avg Amp: ${avg.toFixed(5)}, Samples: ${data.length}`);
 
   // Prevent division by zero or amplifying noise too much if silence
   if (max < 0.001) {
     console.warn("Audio appears silent (max amplitude < 0.001)");
-    return data; 
+    return data;
   }
 
   // Amplification factor. Target peak of 0.95.
   const target = 0.95;
   const scaler = target / max;
 
+  console.log(`[Whisper] Normalizing audio with scalar ${scaler.toFixed(2)}`);
+
   const newData = new Float32Array(data.length);
   for (let i = 0; i < data.length; i++) {
     newData[i] = data[i] * scaler;
   }
-  
+
   return newData;
 }
