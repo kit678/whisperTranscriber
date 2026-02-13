@@ -19,8 +19,13 @@ import {
   Code,
   Loader2,
   RefreshCw,
-  Mic2
+  Mic2,
+  Minus,
+  X,
+  Cloud
 } from 'lucide-react';
+import { transcribeWithGroq, polishWithGroq } from './services/groqService';
+import { playStartSound, playStopSound } from './utils/audioFeedback';
 import { AppView, AiMode, DictationSession, UserSettings } from './types';
 import { AI_MODES_CONFIG, INITIAL_SETTINGS } from './constants';
 import { refineText } from './services/geminiService';
@@ -44,7 +49,14 @@ function App() {
   const [isModelReady, setIsModelReady] = useState(false);
   const [modelProgress, setModelProgress] = useState<{ status: string; progress: number } | null>(null);
 
-  const [settings, setSettings] = useState<UserSettings>(INITIAL_SETTINGS);
+  const [settings, setSettings] = useState<UserSettings>(() => {
+    try {
+      const saved = localStorage.getItem('whisper_settings');
+      return saved ? { ...INITIAL_SETTINGS, ...JSON.parse(saved) } : INITIAL_SETTINGS;
+    } catch {
+      return INITIAL_SETTINGS;
+    }
+  });
   const [activeMode, setActiveMode] = useState<AiMode>(settings.defaultMode);
 
   // History State
@@ -71,10 +83,54 @@ function App() {
 
     // Listen for device changes (plugging in new mic)
     navigator.mediaDevices.addEventListener('devicechange', getAudioDevices);
+
+    // Electron IPC listener
+    let cleanupElectron: (() => void) | undefined;
+    if (window.electronAPI) {
+      console.log("Registering Electron IPC listener");
+      cleanupElectron = window.electronAPI.onToggleRecording(() => {
+        console.log("Toggle recording received from Electron");
+        // We need to access the current state of isRecording.
+        // Since this closure captures the initial state, we use a ref or functional update.
+        // Actually, we can trigger a click on the button or use a ref-backed handler.
+        // Let's use a custom event or just dispatch to a ref-based controller.
+        // Easiest is to dispatch a custom event to window or document, but let's try calling a ref function.
+        if (toggleRecordingRef.current) {
+          toggleRecordingRef.current();
+        }
+      });
+    }
+
     return () => {
       navigator.mediaDevices.removeEventListener('devicechange', getAudioDevices);
+      if (cleanupElectron) cleanupElectron();
     };
   }, []);
+
+  // Check if we need a ref for toggle behavior
+  const toggleRecordingRef = useRef<() => void>();
+
+  // Update the ref whenever the toggle function changes (which depends on state)
+  useEffect(() => {
+    toggleRecordingRef.current = () => {
+      if (isRecordingRef.current) {
+        stopRecordingRef.current?.();
+      } else {
+        startRecordingRef.current?.();
+      }
+    };
+  }, [isRecording, isModelReady, isProcessing]); // Dependencies will be handled via refs below
+
+  // We need refs to access current functions inside the static useEffect
+  const isRecordingRef = useRef(isRecording);
+  isRecordingRef.current = isRecording;
+
+  const startRecordingRef = useRef<() => void>();
+  const stopRecordingRef = useRef<() => void>();
+
+
+
+
 
   const getAudioDevices = async () => {
     try {
@@ -127,8 +183,13 @@ function App() {
     localStorage.setItem('whisper_history', JSON.stringify(history));
   }, [history]);
 
+  useEffect(() => {
+    localStorage.setItem('whisper_settings', JSON.stringify(settings));
+  }, [settings]);
+
   const startRecording = async () => {
     if (!isModelReady) return;
+    playStartSound();
     try {
       // Use selected microphone if available
       const constraints: MediaStreamConstraints = {
@@ -174,6 +235,7 @@ function App() {
   };
 
   const stopRecording = () => {
+    playStopSound();
     if (mediaRecorderRef.current && isRecording) {
       mediaRecorderRef.current.stop();
       setIsRecording(false);
@@ -193,23 +255,39 @@ function App() {
       const audioBlob = new Blob(audioChunksRef.current, { type: mimeTypeRef.current || 'audio/webm' });
       console.log(`[App] Recording stopped. Total Blob size: ${audioBlob.size} bytes, Type: ${audioBlob.type}`);
 
-      // 1. Transcribe with Local Whisper
-      let transcribedText = await transcribeWithWhisper(audioBlob);
+      // 1. Transcription (Local vs Groq)
+      let transcribedText = "";
+      if (settings.transcriptionProvider === 'groq') {
+        if (!settings.groqApiKey) {
+          throw new Error("Groq API Key is missing. Please add it in Settings.");
+        }
+        setProcessingStage("Transcribing with Groq...");
+        transcribedText = await transcribeWithGroq(audioBlob, settings.groqApiKey);
+      } else {
+        // Local Whisper
+        transcribedText = await transcribeWithWhisper(audioBlob);
+      }
 
       if (!transcribedText || !transcribedText.trim()) {
-        // More descriptive error if still failing, but normalization should fix this.
         throw new Error("No speech detected. Ensure microphone volume is up.");
       }
 
-      // 2. Refine with Gemini (if mode is not Verbatim)
+      // 2. Refine (Local Gemini vs Groq)
+      // Logic: If user selected Groq for transcription, use Groq for polish to keep it consistent/fast.
+      // Otherwise default to Gemini (Local config).
       if (activeMode !== AiMode.VERBATIM) {
         setProcessingStage(`Applying ${activeMode} mode...`);
         try {
           const modeConfig = AI_MODES_CONFIG[activeMode];
-          transcribedText = await refineText(transcribedText, modeConfig.prompt);
+
+          if (settings.transcriptionProvider === 'groq' && settings.groqApiKey) {
+            transcribedText = await polishWithGroq(transcribedText, modeConfig.prompt, settings.groqApiKey);
+          } else {
+            // Default to Gemini
+            transcribedText = await refineText(transcribedText, modeConfig.prompt);
+          }
         } catch (refineError) {
           console.warn("Refinement failed, falling back to verbatim", refineError);
-          // Fallback to verbatim is automatic since transcribedText holds the whisper output
         }
       }
 
@@ -227,8 +305,14 @@ function App() {
 
       setHistory(prev => [newSession, ...prev]);
 
+
       if (settings.autoCopy) {
         copyToClipboard(transcribedText);
+      }
+
+      // Send to Electron (if available) for auto-paste
+      if (window.electronAPI) {
+        window.electronAPI.sendTranscription(transcribedText);
       }
 
     } catch (err: any) {
@@ -238,6 +322,23 @@ function App() {
       setProcessingStage("");
     }
   };
+
+
+  // Update the ref whenever the toggle function changes (which depends on state)
+  useEffect(() => {
+    toggleRecordingRef.current = () => {
+      if (isRecordingRef.current) {
+        stopRecordingRef.current?.();
+      } else {
+        startRecordingRef.current?.();
+      }
+    };
+  }, [isRecording, isModelReady, isProcessing]);
+
+  useEffect(() => {
+    startRecordingRef.current = startRecording;
+    stopRecordingRef.current = stopRecording;
+  }, [startRecording, stopRecording]);
 
   const copyToClipboard = async (text: string) => {
     try {
@@ -509,6 +610,51 @@ function App() {
               </select>
             </div>
 
+            {/* Transcription Provider Selection */}
+            <div className="flex flex-col gap-4 p-4 bg-zinc-900/50 rounded-lg border border-white/5">
+              <div>
+                <div className="font-medium">Transcription Engine</div>
+                <div className="text-sm text-zinc-500">Choose between local privacy or cloud speed.</div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 bg-zinc-800 p-1 rounded-lg">
+                <button
+                  onClick={() => setSettings({ ...settings, transcriptionProvider: 'local' })}
+                  className={`flex items-center justify-center gap-2 py-2 px-4 rounded-md text-sm font-medium transition-all ${settings.transcriptionProvider === 'local'
+                    ? 'bg-zinc-600 text-white shadow-sm'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                >
+                  <Cpu className="w-4 h-4" /> Local (Whisper)
+                </button>
+                <button
+                  onClick={() => setSettings({ ...settings, transcriptionProvider: 'groq' })}
+                  className={`flex items-center justify-center gap-2 py-2 px-4 rounded-md text-sm font-medium transition-all ${settings.transcriptionProvider === 'groq'
+                    ? 'bg-primary text-white shadow-sm'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                >
+                  <Cloud className="w-4 h-4" /> Cloud (Groq API)
+                </button>
+              </div>
+
+              {settings.transcriptionProvider === 'groq' && (
+                <div className="mt-2 animate-in fade-in slide-in-from-top-2">
+                  <label className="block text-xs font-medium text-zinc-400 mb-1.5 ">Groq API Key</label>
+                  <input
+                    type="password"
+                    value={settings.groqApiKey || ''}
+                    onChange={(e) => setSettings({ ...settings, groqApiKey: e.target.value })}
+                    placeholder="gsk_..."
+                    className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white focus:ring-2 focus:ring-primary/50 outline-none placeholder:text-zinc-600"
+                  />
+                  <p className="text-xs text-zinc-500 mt-1.5">
+                    Get a free key at <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="text-primary hover:underline">console.groq.com</a>
+                  </p>
+                </div>
+              )}
+            </div>
+
             <div className="flex items-center justify-between p-4 bg-zinc-900/50 rounded-lg border border-white/5">
               <div>
                 <div className="font-medium">Default Mode</div>
@@ -565,19 +711,44 @@ function App() {
   );
 
   return (
-    <div className="flex h-screen bg-background text-zinc-100 font-sans selection:bg-primary/30">
-      {renderSidebar()}
+    <div className="flex flex-col h-screen bg-background text-zinc-100 font-sans selection:bg-primary/30">
+      {/* Draggable Title Bar */}
+      <div
+        className="h-8 flex items-center justify-end px-2 bg-surface/80 border-b border-white/5 shrink-0"
+        style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
+      >
+        <div className="flex gap-1" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          <button
+            onClick={() => window.electronAPI?.minimizeWindow()}
+            className="w-6 h-6 rounded flex items-center justify-center text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700 transition-colors"
+            title="Minimize"
+          >
+            <Minus className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => window.electronAPI?.closeWindow()}
+            className="w-6 h-6 rounded flex items-center justify-center text-zinc-400 hover:text-red-400 hover:bg-red-500/20 transition-colors"
+            title="Close"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
 
-      <main className="flex-1 flex overflow-hidden relative">
-        <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 pointer-events-none"></div>
-        {/* Ambient Glows */}
-        <div className="absolute top-0 left-0 w-full h-1/2 bg-primary/5 blur-[120px] pointer-events-none"></div>
-        <div className="absolute bottom-0 right-0 w-1/2 h-1/2 bg-accent/5 blur-[120px] pointer-events-none"></div>
+      <div className="flex flex-1 overflow-hidden">
+        {renderSidebar()}
 
-        {view === AppView.RECORDER && renderRecorder()}
-        {view === AppView.HISTORY && renderHistory()}
-        {view === AppView.SETTINGS && renderSettings()}
-      </main>
+        <main className="flex-1 flex overflow-hidden relative">
+          <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 pointer-events-none"></div>
+          {/* Ambient Glows */}
+          <div className="absolute top-0 left-0 w-full h-1/2 bg-primary/5 blur-[120px] pointer-events-none"></div>
+          <div className="absolute bottom-0 right-0 w-1/2 h-1/2 bg-accent/5 blur-[120px] pointer-events-none"></div>
+
+          {view === AppView.RECORDER && renderRecorder()}
+          {view === AppView.HISTORY && renderHistory()}
+          {view === AppView.SETTINGS && renderSettings()}
+        </main>
+      </div>
     </div>
   );
 }

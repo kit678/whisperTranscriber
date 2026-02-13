@@ -5,7 +5,7 @@ const apiKey = process.env.API_KEY || '';
 const ai = new GoogleGenAI({ apiKey });
 
 export const refineText = async (text: string, instruction: string): Promise<string> => {
-     if (!apiKey) {
+  if (!apiKey) {
     throw new Error("API Key is missing. Refinement unavailable.");
   }
 
@@ -14,6 +14,9 @@ export const refineText = async (text: string, instruction: string): Promise<str
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: `Original Text: "${text}"\n\nInstruction: ${instruction}\n\nOutput only the result.`,
+      config: {
+        temperature: 0.2,
+      },
     });
 
     return response.text || text;

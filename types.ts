@@ -29,9 +29,24 @@ export interface UserSettings {
   language: string;
   openAiKey?: string; // Not used, but typical for this app type
   selectedMicrophoneId?: string;
+  transcriptionProvider: 'local' | 'groq';
+  groqApiKey?: string;
 }
 
 export interface AudioVisualizerProps {
   isRecording: boolean;
   audioData: Uint8Array;
+}
+
+export interface ElectronAPI {
+  onToggleRecording: (callback: () => void) => () => void;
+  sendTranscription: (text: string) => void;
+  minimizeWindow: () => void;
+  closeWindow: () => void;
+}
+
+declare global {
+  interface Window {
+    electronAPI?: ElectronAPI;
+  }
 }

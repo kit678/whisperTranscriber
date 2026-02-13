@@ -8,7 +8,7 @@ export const AI_MODES_CONFIG: Record<AiMode, { icon: string; prompt: string; des
   },
   [AiMode.POLISHED]: {
     icon: 'Wand2',
-    prompt: "Transcribe the audio and then polish the text to be professional, clear, and grammatically correct. Remove redundancy.",
+    prompt: "Polish the following text to improve grammar, clarity, and readability while strictly preserving the original meaning and intent. Fix typos and awkward phrasing, but do not change technical terms, specific details, or the author's tone. Only make minimal necessary changes.",
     description: "Professional, grammar-perfect text."
   },
   [AiMode.SUMMARIZED]: {
@@ -37,5 +37,7 @@ export const INITIAL_SETTINGS = {
   defaultMode: AiMode.VERBATIM,
   autoCopy: false,
   language: 'en-US',
-  selectedMicrophoneId: ''
+  selectedMicrophoneId: '',
+  transcriptionProvider: 'local',
+  groqApiKey: ''
 };

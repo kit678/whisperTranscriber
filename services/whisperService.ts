@@ -1,11 +1,14 @@
 // Worker code as a string to avoid file serving issues in this environment
-const WORKER_CODE = `
-import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js';
+// We use a function to generate the worker code so we can dynamically inject library URL
+const createWorkerCode = (libUrl: string) => `
+import { pipeline, env } from '${libUrl}';
 
-// Define local model path configuration
+// Configure to use local models
 env.allowLocalModels = true;
 env.allowRemoteModels = false;
-env.localModelPath = '/models/';
+
+// WebGPU settings
+env.backends.onnx.wasm.numThreads = 1;
 
 let transcriber = null;
 
@@ -15,16 +18,41 @@ self.onmessage = async (e) => {
 
   try {
     if (type === 'load') {
-      console.log('[Whisper Worker] Loading model...');
+      console.log('[Whisper Worker] Loading Whisper model...');
+
+      if (e.data.modelBaseUrl) {
+         env.localModelPath = e.data.modelBaseUrl;
+         console.log('[Whisper Worker] Set localModelPath to:', env.localModelPath);
+      }
+
+      // Verify WebGPU support and request high-performance GPU (NVIDIA)
+      let gpuAdapter = null;
+      if (!navigator.gpu) {
+        console.warn('[Whisper Worker] WebGPU is NOT available!');
+      } else {
+        // Request high-performance adapter (NVIDIA) instead of default (Intel)
+        gpuAdapter = await navigator.gpu.requestAdapter({
+          powerPreference: 'high-performance'
+        });
+        console.log('[Whisper Worker] WebGPU Adapter:', gpuAdapter?.info);
+        console.log('[Whisper Worker] Requested power preference: high-performance');
+      }
+
       if (!transcriber) {
-        // Using quantized whisper-tiny.en which should be available locally
-        transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en', {
+        transcriber = await pipeline('automatic-speech-recognition', 'onnx-community/whisper-small.en', {
+          device: 'webgpu',
+          dtype: 'fp32',
           progress_callback: (data) => {
             self.postMessage({ type: 'progress', data });
           }
         });
       }
-      console.log('[Whisper Worker] Model loaded successfully');
+      
+      // Final confirmation of GPU being used
+      console.log('[Whisper Worker] ✅ Model loaded successfully with WebGPU');
+      if (gpuAdapter?.info) {
+        console.log(\`[Whisper Worker] 🎮 Using GPU: \${gpuAdapter.info.vendor} \${gpuAdapter.info.architecture || gpuAdapter.info.device || ''}\`);
+      }
       self.postMessage({ type: 'ready' });
     } else if (type === 'transcribe') {
       if (!transcriber) {
@@ -33,18 +61,15 @@ self.onmessage = async (e) => {
       
       console.log('[Whisper Worker] Starting transcription, audio samples:', audio.length);
       
-      // Run transcription
-      // Note: For English-only models (whisper-tiny.en), do NOT force 'language' 
-      // as they don't have the multilingual token set.
+      // Optimized transcription settings
       const output = await transcriber(new Float32Array(audio), {
-        chunk_length_s: 30,
-        stride_length_s: 5,
-        task: 'transcribe',
+        chunk_length_s: 20,       // Reduced from 30 for faster per-chunk processing
+        stride_length_s: 8,       // Increased from 5 to reduce overlap computation
+        return_timestamps: false, // Skip timestamp calculation for speed
       });
       
       console.log('[Whisper Worker] Raw output:', JSON.stringify(output));
       
-      // Output structure differs slightly based on version/task, usually it's { text: "..." } or [{ text: "..." }]
       const text = Array.isArray(output) ? output[0].text : output.text;
       
       console.log('[Whisper Worker] Extracted text:', text);
@@ -71,11 +96,22 @@ export const initWhisper = (onProgress?: (data: any) => void): Promise<void> => 
       onProgressCallback = onProgress;
     }
 
-    const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
+    // Calculate absolute path to models directory
+    const modelBaseUrl = new URL('models/', window.location.href).href;
+    console.log('[Whisper] Using local model path:', modelBaseUrl);
+
+    // Use local transformers.js v3.1.2
+    const libUrl = new URL('libs/transformers/3.1.2/transformers.min.js', window.location.href).href;
+    console.log('[Whisper] Using local lib path:', libUrl);
+
+    const workerCode = createWorkerCode(libUrl);
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
     worker = new Worker(URL.createObjectURL(blob), { type: 'module' });
 
     worker.onmessage = (e) => {
-      console.log('[Whisper] Worker message:', e.data);
+      if (e.data.type !== 'progress') {
+        console.log('[Whisper] Worker message:', e.data);
+      }
       const { type, data, error } = e.data;
       if (type === 'ready') {
         console.log('[Whisper] Model ready');
@@ -92,7 +128,7 @@ export const initWhisper = (onProgress?: (data: any) => void): Promise<void> => 
       reject(new Error("Worker script failed to load. Check your connection or Content Security Policy."));
     };
 
-    worker.postMessage({ type: 'load' });
+    worker.postMessage({ type: 'load', modelBaseUrl });
   });
 };
 
